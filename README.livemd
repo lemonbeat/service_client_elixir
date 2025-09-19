@@ -1,0 +1,642 @@
+# Service Client Demo for Lemonbeat IoT Backend
+
+```elixir
+Mix.install([
+  {:amqp, "~> 4.1"},
+  {:kino, "~> 0.17.0"},
+  {:elixir_xml_to_map, "~> 3.1"},
+])
+```
+
+[Livebook](https://livebook.dev/) with examples on how to connect to the Lemonbeat Operations platform.
+
+## Setup credentials
+
+Start by providing your credentials which you should have received from your Lemonbeat contact person.
+
+```elixir
+ssl_options =
+  Enum.join(
+    [
+      "keyfile=#{System.fetch_env!("LB_KEYFILE")}",
+      "certfile=#{System.fetch_env!("LB_CERTFILE")}",
+      "cacertfile=#{System.fetch_env!("LB_CACERTFILE")}",
+      "verify=verify_peer",
+      "server_name_indication=disable",
+      "depth=5"
+    ],
+    "&"
+  )
+
+amqp_username = System.fetch_env!("LB_AMQP_USERNAME")
+amqp_password = System.fetch_env!("LB_AMQP_PASSWORD")
+amqp_host = System.fetch_env!("LB_AMQP_HOST")
+amqp_port = System.fetch_env!("LB_AMQP_PORT") |> String.to_integer()
+amqp_vhost = System.fetch_env!("LB_AMQP_VHOST")
+backend_username = System.fetch_env!("LB_BACKEND_USERNAME")
+backend_password = System.fetch_env!("LB_BACKEND_PASSWORD")
+
+amqp_url =
+  "amqps://#{amqp_username}:#{amqp_password}@#{amqp_host}:#{amqp_port}/#{amqp_vhost}?#{ssl_options}"
+Application.put_env(:lb_client, :amqp, 
+  amqp_url: amqp_url,
+  backend_username: backend_username,
+  backend_password: backend_password
+)
+```
+
+## LbClient - Lemonbeat IoT Backend Client
+
+This module provides a **GenServer-based AMQP client** for communicating with the Lemonbeat IoT Backend system. It implements an RPC (Remote Procedure Call) pattern over AMQP for sending commands to IoT services and receiving responses.
+
+### Overview
+
+The `LbClient` acts as a bridge between your Elixir application and the Lemonbeat IoT platform, handling AMQP connections, message publishing, and response correlation. It encapsulates commands in LsBL (Lemonbeat Smart Backend language) XML envelopes and manages the request-response lifecycle.
+
+### Key Features
+
+* **Multiple Communication Patterns**:
+
+    * **Synchronous RPC** (`call/5`) - Blocks until response is received
+    * **Asynchronous RPC** (`async_call/4`) - Returns a Task for non-blocking calls
+    * **Fire-and-forget** (`cast/4`) - Sends message without expecting a response
+
+* **Automatic Connection Management**: Handles AMQP connection setup, channel management, and queue subscription
+
+* **Response Correlation**: Tracks pending requests using sequence numbers to match responses with callers
+
+* **LSBL Protocol Support**: Automatically wraps commands in proper LSBL XML envelopes with headers, addressing, and tokens
+
+### Architecture
+
+The client maintains an internal state containing:
+
+* AMQP connection and channel references
+* A map of pending requests (sequence_number → caller)
+* Consumer tag for the response queue
+
+### Message Flow
+
+1. **Outgoing**: Commands are wrapped in LSBL envelopes and published to the DMZ exchange with service-specific routing
+2. **Incoming**: Responses are received on a dedicated RPC queue (`PARTNER.DEMO.RPC`) and correlated back to waiting callers
+3. **Error Handling**: Connection failures, duplicate sequences, and malformed responses are handled gracefully
+
+```elixir
+defmodule LbClient do
+  @moduledoc """
+  Minimal example for a Lemonbeat IoT Backend client.
+  """
+  use GenServer
+  require Logger
+  @rpc_queue_name "PARTNER.DEMO.RPC"
+
+  defmodule State do
+    defstruct [
+      :amqp_url,
+      :conn,
+      :channel,
+      :consumer_tag,
+      # %{sequence_number => {caller, timestamp}}
+      :pending_requests
+    ]
+  end
+
+  # Client API
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  # Synchronous RPC - blocks until response
+  def call(service, lsbl_cmd, sequence_number, token \\ nil, timeout \\ 60_000) do
+    GenServer.call(__MODULE__, {:rpc_call, service, lsbl_cmd, sequence_number, token}, timeout)
+  end
+
+  # Asynchronous RPC - returns immediately with a Task
+  def async_call(service, lsbl_cmd, sequence_number, token \\ nil) do
+    Task.async(fn ->
+      call(service, lsbl_cmd, sequence_number, token)
+    end)
+  end
+
+  # Fire-and-forget RPC - no response expected
+  def cast(service, lsbl_cmd, sequence_number, token \\ nil) do
+    GenServer.cast(__MODULE__, {:rpc_cast, service, lsbl_cmd, sequence_number, token})
+  end
+
+  # Generate a random sequence number
+  def generate_random_sequence do
+    # Generate random 12-digit number similar to 651009400401
+    # Enum.random(100_000_000_000..999_999_999_999)
+    Enum.random(100_000_000_000..999_999_999_999) |> Integer.to_string()
+  end
+
+  @impl true
+  def init(opts) do
+    Process.send_after(self(), :connect, 0)
+
+    {:ok,
+     %State{
+       amqp_url: Keyword.get(opts, :amqp_url),
+       pending_requests: %{}
+     }}
+  end
+
+  @impl true
+  def handle_call({:rpc_call, service, lsbl_cmd, sequence_number, token}, from, state) do
+    case Map.has_key?(state.pending_requests, sequence_number) do
+      true ->
+        {:reply, {:error, {:sequence_already_pending, sequence_number}}, state}
+
+      false ->
+        # Add to pending requests
+        new_pending = Map.put(state.pending_requests, sequence_number, from)
+        new_state = %{state | pending_requests: new_pending}
+
+        # Publish the message
+        case publish_message(new_state, service, lsbl_cmd, sequence_number, token) do
+          :ok ->
+            # Don't reply yet - we'll reply when response arrives
+            {:noreply, new_state}
+
+          {:error, reason} ->
+            # Remove from pending on publish failure
+            {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
+  @impl true
+  def handle_cast({:rpc_cast, service, lsbl_cmd, sequence_number, token}, state) do
+    case publish_message(state, service, lsbl_cmd, sequence_number, token) do
+      :ok ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.error("Failed to publish cast message: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:connect, %State{amqp_url: amqp_url} = state) do
+    with {:ok, %AMQP.Connection{} = conn} <- AMQP.Connection.open(amqp_url),
+         {:ok, %AMQP.Channel{} = channel} <- AMQP.Channel.open(conn) do
+      Logger.info("Connection and channel sucessfully opened")
+      Process.send_after(self(), :subscribe, 100)
+      {:noreply, %{state | conn: conn, channel: channel}}
+    else
+      {:error, reason} ->
+        Logger.error(":connect failed: #{inspect(reason)}, stopping process.")
+        {:stop, reason, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:subscribe, %State{channel: channel} = state) do
+    with {:ok, _} <-
+           AMQP.Queue.declare(channel, @rpc_queue_name, exclusive: false, auto_delete: true),
+         :ok <-
+           AMQP.Queue.bind(channel, @rpc_queue_name, "PARTNER", routing_key: @rpc_queue_name),
+         :ok,
+         AMQP.Basic.qos(channel, prefetch_count: 1),
+         {:ok, consumer_tag} <- AMQP.Basic.consume(channel, @rpc_queue_name, self(), no_ack: true) do
+      Logger.info("Sucessfully subscribed on #{@rpc_queue_name}")
+      {:noreply, %{state | consumer_tag: consumer_tag}}
+    else
+      {:error, reason} ->
+        Logger.error(":subscribe failed: #{inspect(reason)}, stopping process.")
+        {:stop, reason, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:basic_consume_ok, %{consumer_tag: consumer_tag}}, state) do
+    Logger.info("Consuming with tag: #{inspect(consumer_tag)}")
+    {:noreply, %State{state | consumer_tag: consumer_tag}}
+  end
+
+  @impl true
+  def handle_info({:basic_deliver, payload, _meta}, state) do
+    Logger.info("Received reply: #{payload}")
+
+    response =
+      payload
+      |> XmlToMap.naive_map()
+      |> handle_response()
+
+    # %{response_key: response_key, value: response_value, sequence_number: sequence_number}
+    case response do
+      %{value: response_value, sequence_number: sequence_number}
+      when not is_nil(sequence_number) ->
+        case Map.pop(state.pending_requests, sequence_number) do
+          {caller, remaining_pending} when caller != nil ->
+            # Reply to the waiting caller
+            GenServer.reply(caller, {:ok, response_value})
+            new_state = %{state | pending_requests: remaining_pending}
+            {:noreply, new_state}
+
+          {nil, _} ->
+            # No one waiting for this response (maybe a cast or timeout)
+            Logger.info("Received response for sequence #{sequence_number} but no caller waiting")
+            {:noreply, state}
+        end
+
+      error ->
+        Logger.error("Failed to extract sequence from response: #{inspect(error)}")
+        {:noreply, state}
+    end
+  end
+
+  # Catch-all handler (put this LAST)
+  def handle_info(msg, state) do
+    Logger.warning("Unhandled message: #{inspect(msg)}")
+    {:noreply, state}
+  end
+
+  defp create_lsbl_envelope(opts) do
+    seq = Keyword.get(opts, :seq, Enum.random(1..999_999_999_999))
+    target = Keyword.get(opts, :target)
+    src = Keyword.get(opts, :src)
+    token = Keyword.get(opts, :token)
+    cmd = Keyword.get(opts, :cmd, "")
+
+    """
+    <lsbl xmlns="urn:lsbl-envelope" version="4.15.0">
+        <adr target="#{target}" src="#{src}" type="LSBL_Request" seq="#{seq}"></adr>
+        <hdr>
+          <token>#{token}</token>
+        </hdr>
+        <cmd>#{cmd}</cmd>
+    </lsbl>
+    """
+  end
+
+  defp publish_message(
+         %State{channel: channel},
+         service,
+         lsbl_cmd,
+         sequence_number,
+         token
+       ) do
+    IO.inspect(
+      "Publishing message on channel #{inspect(channel)} for service #{service} with command #{lsbl_cmd} with sequence number #{sequence_number} and token #{token}"
+    )
+
+    lsbl_message =
+      create_lsbl_envelope(
+        cmd: lsbl_cmd,
+        target: service,
+        token: token,
+        src: @rpc_queue_name,
+        seq: sequence_number
+      )
+
+    case AMQP.Basic.publish(channel, "DMZ", service, lsbl_message) do
+      :ok ->
+        Logger.info("Published async message to: #{service} with seq: #{sequence_number}")
+
+      {:error, reason} ->
+        Logger.error("Failed to publish message: #{inspect(reason)}")
+    end
+  end
+
+  defp handle_response(%{
+         "lsbl" => %{
+           "#content" => %{
+             "adr" => %{"-seq" => sequence_number},
+             "hdr" => _hdre,
+             "response" => response
+           }
+         }
+       }) do
+    response_key = Map.keys(response) |> Enum.at(0)
+    response_value = Map.get(response, response_key)
+    %{response_key: response_key, value: response_value, sequence_number: sequence_number}
+  end
+
+  defp handle_response(_response), do: %{response_key: nil, value: nil, sequence_number: nil}
+end
+```
+
+## UserService - Lemonbeat User Authentication Command Builder
+
+This module provides utility functions for creating LSBL (Lemonbeat Smart Backend Language) XML commands specifically for user authentication operations within the Lemonbeat IoT ecosystem.
+
+### Overview
+
+The `UserService` module acts as a **command factory** for user-related operations, generating properly formatted XML commands that can be sent through the `LbClient` to authenticate users and manage authentication tokens in the Lemonbeat backend.
+
+### Key Features
+
+* **User Login Commands**: Creates XML for username/password authentication
+* **Token Refresh Commands**: Creates XML for refreshing authentication tokens
+* **LSBL Compliance**: Generates XML that conforms to the Lemonbeat user service namespace (`urn:lsbl_user_service`)
+* **Simple API**: Clean functions that take minimal parameters and return ready-to-use XML
+
+### Functions
+
+#### `create_lsbl_user_login/2`
+
+Generates an XML command for user authentication using credentials.
+
+**Parameters:**
+
+* `username` - The user's login name
+* `password` - The user's password
+
+**Returns:** XML string formatted for LSBL user login
+
+#### `create_lsbl_token_refresh/1`
+
+Generates an XML command for refreshing an existing authentication token.
+
+**Parameters:**
+
+* `token` - The current authentication token to refresh
+
+**Returns:** XML string formatted for LSBL token refresh
+
+### XML Structure
+
+Both functions generate commands wrapped in a `<user_cmd>` envelope with service-specific elements using the `urn:lsbl_user_service` namespace, ensuring proper routing and processing by the Lemonbeat user service.
+
+### Integration
+
+This module is designed to work seamlessly with `LbClient`, providing the XML command strings that can be passed as the `lsbl_cmd` parameter to the client's `call/5`, `async_call/4`, or `cast/4` functions.
+
+The separation of command generation from communication logic promotes clean architecture and makes it easy to test authentication logic independently of AMQP concerns.
+
+```elixir
+defmodule UserService do
+  @moduledoc """
+    User service Module
+  """
+
+    def create_lsbl_user_login(username, password) do
+    """
+    <user_cmd>
+      <user_login xmlns="urn:lsbl_user_service">
+        <username>#{username}</username>
+        <password>#{password}</password>
+      </user_login>
+    </user_cmd>
+    """
+  end
+  
+  def create_lsbl_token_refresh(token) do
+    """
+    <user_cmd>
+      <user_token_refresh xmlns="urn:lsbl_user_service">
+        <token>#{token}</token>
+      </user_token_refresh>
+    </user_cmd>
+    """
+  end 
+end
+```
+
+## ValueService - Lemonbeat Device Value Management Command Builder
+
+This module provides utility functions for creating LSBL (Lemonbeat Structured Binary Language) XML commands for device value operations within the Lemonbeat IoT ecosystem. It enables reading and writing device values using SGTIN (Serialized Global Trade Item Number) identifiers.
+
+### Overview
+
+The `ValueService` module acts as a **command factory** for device value management operations, generating properly formatted XML commands that can be sent through the `LbClient` to interact with IoT device values in the Lemonbeat backend. It handles both retrieving current device values and setting new values.
+
+### Key Features
+
+* **Value Retrieval**: Creates XML commands to get current device values by SGTIN
+* **Value Setting**: Creates XML commands to set multiple device values with a single request
+* **SGTIN-based Addressing**: Uses industry-standard SGTIN for device identification
+* **LSDL Integration**: Embeds LSDL (****) for complex value operations
+* **LSBL Compliance**: Generates XML conforming to the `urn:lsbl_value_service` namespace
+* **Batch Operations**: Supports setting multiple values in a single command
+
+### Functions
+
+#### `value_get_by_sgtin/1`
+
+Generates an XML command to retrieve all current values from a specific device.
+
+**Parameters:**
+
+* `sgtin` - The Serialized Global Trade Item Number identifying the target device
+
+**Returns:** XML string formatted for LSBL value retrieval
+
+#### `value_set_by_sgtin/2`
+
+Generates an XML command to set multiple values on a specific device.
+
+**Parameters:**
+
+* `device_sgtin` - The SGTIN of the target device
+* `values` - List of value maps containing:
+    * `number` - The value identifier number
+    * `value_id` - The specific value ID to set
+    * `timestamp` - Timestamp (defaults to "0" for immediate)
+
+**Returns:** XML string formatted for LSBL value setting with embedded LSDL
+
+### XML Structure
+
+The module generates two types of commands:
+
+1. **Value Get**: Simple request structure for retrieving device values
+2. **Value Set**: Complex structure with embedded LSDL containing device network definitions and value specifications wrapped in CDATA sections
+
+### Integration
+
+This module integrates seamlessly with:
+
+* **`LbClient`** - For sending commands to the Lemonbeat backend
+* **`UserService`** - Authentication tokens from user login can be used with value operations
+
+```elixir
+defmodule ValueService do
+  @moduledoc """
+    User service Module
+  """
+
+  def value_get_by_sgtin(sgtin) do
+    """
+    <value_cmd>
+      <value_get xmlns="urn:lsbl_value_service">
+        <device_sgtin>#{sgtin}</device_sgtin>
+      </value_get>
+    </value_cmd>
+    """
+  end
+
+  def value_set_by_sgtin(device_sgtin, values \\ []) do
+    value_set_string =
+      values
+      |> Enum.map(fn item ->
+        """
+        <value_set number="#{item.number}" value_id="#{item.value_id}" timestamp="0" />
+        """
+      end)
+      |> Enum.join("")
+
+    """
+    <value_cmd>
+      <value_set xmlns="urn:lsbl_value_service">
+        <device_sgtin>#{device_sgtin}</device_sgtin>
+        <lsdl>
+          <![CDATA[ 
+            <network xmlns="urn:valuexsd" version="1">
+              <device device_id="1" version="1">
+               #{value_set_string}
+              </device> 
+            </network>
+           ]]>
+        </lsdl>
+      </value_set>
+    </value_cmd>
+    """
+  end
+end
+```
+
+## LBApplication - Lemonbeat Client Application
+
+The main **OTP Application** module that starts and supervises the Lemonbeat IoT client system. It reads AMQP configuration from the application environment and launches a single `LbClient` GenServer under a `:one_for_one` supervision strategy.
+
+### Key Features
+
+* **Configuration-driven startup** - Reads AMQP URL from app config
+* **Supervised operation** - Automatically restarts the client on failures
+* **Single client instance** - One `LbClient` process for the entire application
+* **Fault tolerance** - Maintains reliable IoT backend connectivity
+
+The application serves as the entry point for the Lemonbeat client system, ensuring the AMQP communication layer stays running and can recover from network issues or crashes.
+
+```elixir
+defmodule LBApplication do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    amqp_url = Application.get_env(:lb_client, :amqp)|>Keyword.get(:amqp_url)
+    children = [
+      # Single LbClient instance
+      {LbClient, [amqp_url: amqp_url]},
+    ]
+
+    opts = [strategy: :one_for_one, name: LB.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+
+```
+
+## Application Start
+
+```elixir
+# Start the application
+{:ok, _} = LBApplication.start(:normal, [])
+```
+
+## Example User Authentification
+
+This code demonstrates **asynchronous user authentication** with the Lemonbeat backend using the client services.
+
+**Step-by-step breakdown:**
+
+1. **Generate sequence ID** - Creates unique identifier for request correlation
+2. **Build login command** - Creates LSBL XML authentication payload
+3. **Async call** - Sends login request without blocking, returns a Task
+4. **Wait for response** - Blocks until authentication completes
+5. **Extract token** - Pattern matches the nested response to get auth token
+
+**Key points:**
+
+* **Non-blocking** - `async_call` allows other operations while waiting
+* **Service routing** - Uses `"SERVICE.USERSERVICE"` queue for authentication
+* **Response parsing** - Expects structured map with nested token value
+* **Commented sync version** - Shows alternative blocking `call/3` approach
+
+This pattern is useful when you need to perform multiple concurrent operations or want to avoid blocking the calling process during network requests.
+
+```elixir
+seq1 = LbClient.generate_random_sequence()
+cmd1 = UserService.create_lsbl_user_login(backend_username, backend_password)
+task = LbClient.async_call("SERVICE.USERSERVICE", cmd1, seq1)
+{:ok, response} = Task.await(task)
+%{"user_login" => %{"token" => token}} = response
+
+```
+
+```elixir
+token
+```
+
+## Example Value Get by Sgtin
+
+This code demonstrates **asynchronous device value retrieval** using an SGTIN (Serialized Global Trade Item Number) identifier.
+
+**Step-by-step breakdown:**
+
+1. **Device identifier** - SGTIN uniquely identifies the IoT device/product
+2. **Generate sequence** - Creates correlation ID for this specific value request
+3. **Build command** - Creates LSBL XML payload to query device values
+4. **Authenticated call** - Uses the auth token from previous login
+5. **Await response** - Blocks until device values are retrieved
+
+**Key points:**
+
+* **Device targeting** - SGTIN precisely identifies which device to query
+* **Authenticated request** - Requires valid token from user login
+* **Service routing** - Uses `"SERVICE.VALUESERVICE"` for device operations
+* **Async pattern** - Non-blocking call allows concurrent operations
+
+```elixir
+sgtin = "85281757505752077192055F"
+value_get_seq = LbClient.generate_random_sequence()
+value_get_cmd = ValueService.value_get_by_sgtin(sgtin)
+task = LbClient.async_call("SERVICE.VALUESERVICE", value_get_cmd, value_get_seq, token)
+{:ok, value_response} = Task.await(task)
+```
+
+## Example Value Set
+
+This code demonstrates **asynchronous device control** by setting multiple values on a specific IoT device identified by SGTIN.
+
+**Step-by-step breakdown:**
+
+1. **Target device** - Same SGTIN as previous read operation
+2. **Control values** - Array of value_id/number pairs for device configuration
+3. **Build set command** - Creates LSBL XML payload with multiple value updates
+4. **Authenticated call** - Uses auth token to authorize device modifications
+5. **Await confirmation** - Blocks until device acknowledges value changes
+
+**Value patterns:**
+
+* `number: 0` - Typically means **OFF/DISABLE/FALSE**
+* `number: 1` - Typically means **ON/ENABLE/TRUE**
+* `value_id` - Maps to specific device parameters (sensors, actuators, config)
+    *
+
+```elixir
+sgtin = "85281757505752077192055F"
+
+values = [
+  %{value_id: 1, number: 0},
+  %{value_id: 5, number: 1},
+  %{value_id: 8, number: 1},
+  %{value_id: 14, number: 0},
+  %{value_id: 3, number: 1},
+  %{value_id: 7, number: 0},
+  %{value_id: 9, number: 1},
+]
+
+value_set_seq = LbClient.generate_random_sequence()
+value_set_cmd = ValueService.value_set_by_sgtin(sgtin, values)
+
+
+task = LbClient.async_call("SERVICE.VALUESERVICE", value_set_cmd, value_set_seq, token)
+{:ok, value_response} = Task.await(task)
+```
+
+<!-- livebook:{"offset":21550,"stamp":{"token":"XCP.9hD-tI_ntIUf3sA0yXmQTeRBXDpAfGtwe707YTO1V3IvjKWF_vnMmuFVK6hVGx1yQaEO7b6GDjpGbJM5hngzQcfzkE7snyK-E9whf5Sf2fk5mfqZYf0_YeB4J4ehgt7U6O78t-NRcvvQq6o2Owf3tn1KnfyZ8ae33KS-D3gpB4tO6Iieu5m0nvWlVumV_P1WN-hpyaYASuZ1SGBYqzzqsZAYUsA6LnZ5SxrvZw6CKSKLXyUizGhKAdqhooVxAulJ5Zb36Z7qPnX5FszDV-RZ1D2ogLCEnIUGidutmkvpZgspqUWxBaaZ","version":2}} -->
